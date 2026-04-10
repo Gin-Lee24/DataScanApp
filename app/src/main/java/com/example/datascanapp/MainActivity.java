@@ -8,56 +8,76 @@ import android.bluetooth.le.ScanResult;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.widget.TextView;
 import android.widget.Toast;
+
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
+
 import com.google.android.material.button.MaterialButton;
-import java.io.File;
-import java.io.FileWriter;
-import java.io.IOException;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
 
+import retrofit2.Call;
+import retrofit2.Callback;
+import retrofit2.Response;
+import retrofit2.Retrofit;
+import retrofit2.converter.gson.GsonConverterFactory;
+import retrofit2.converter.scalars.ScalarsConverterFactory;
+
 public class MainActivity extends AppCompatActivity {
 
-    private BluetoothLeScanner bluetoothLeScanner; // [cite: 410]
+    private BluetoothLeScanner bluetoothLeScanner;
     private ScanCallback scanCallback;
     private boolean isScanning = false;
     private TextView txtLog, txtStatus;
     private StringBuilder csvBuffer = new StringBuilder();
 
+    private Retrofit retrofit;
+
+    // 라즈베리파이 이름
+    private static final String TARGET_NAME = "Opensrc_team2";
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_main); // [cite: 715]
+        setContentView(R.layout.activity_main);
 
-        // 1. UI 요소 연결
+        Gson gson = new GsonBuilder().setLenient().create();
+
+        retrofit = new Retrofit.Builder()
+                .baseUrl("http://203.255.81.72:10021/")
+                .addConverterFactory(ScalarsConverterFactory.create())
+                .addConverterFactory(GsonConverterFactory.create(gson))
+                .build();
+
         txtLog = findViewById(R.id.txtLog);
         txtStatus = findViewById(R.id.txtStatus);
         MaterialButton btnScan = findViewById(R.id.btnScan);
         MaterialButton btnStop = findViewById(R.id.btnStop);
         MaterialButton btnSave = findViewById(R.id.btnSave);
 
-        // 2. 블루투스 어댑터 초기화 [cite: 411]
         BluetoothAdapter bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
         if (bluetoothAdapter != null) {
             bluetoothLeScanner = bluetoothAdapter.getBluetoothLeScanner();
         }
 
-        // 3. 실행 시 권한 요청 [cite: 361, 390]
         checkPermissions();
 
-        // 4. 버튼 클릭 이벤트 설정
         btnScan.setOnClickListener(v -> {
-            txtLog.setText(""); // 1. 로그 창에 있던 "아직 수집된 데이터가 없어요"를 지운다.
-            startScanning();    // 2. 실제 스캔 기능을 시작한다.
-            txtStatus.setText("스캔 중..."); // 3. 상태 표시를 바꾼다.
+            txtLog.setText("");
+            csvBuffer.setLength(0);
+            startScanning();
+            txtStatus.setText("스캔 중...");
         });
 
         btnStop.setOnClickListener(v -> stopScanning());
-        btnSave.setOnClickListener(v -> saveToCsv());
+        btnSave.setOnClickListener(v -> sendDataToServer());
     }
 
     private void checkPermissions() {
@@ -66,7 +86,7 @@ public class MainActivity extends AppCompatActivity {
                     Manifest.permission.BLUETOOTH_SCAN,
                     Manifest.permission.BLUETOOTH_CONNECT,
                     Manifest.permission.ACCESS_FINE_LOCATION
-            }, 100); // [cite: 371-375]
+            }, 100);
         } else {
             ActivityCompat.requestPermissions(this, new String[]{
                     Manifest.permission.ACCESS_FINE_LOCATION
@@ -75,9 +95,9 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startScanning() {
-        // 실행 전 권한이 진짜 있는지 최종 확인 (에러 방지용) [cite: 386-389]
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-            checkPermissions(); // 권한 없으면 다시 요청 [cite: 390]
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN)
+                != PackageManager.PERMISSION_GRANTED) {
+            checkPermissions();
             return;
         }
 
@@ -85,61 +105,114 @@ public class MainActivity extends AppCompatActivity {
             scanCallback = new ScanCallback() {
                 @Override
                 public void onScanResult(int callbackType, ScanResult result) {
-                    String address = result.getDevice().getAddress();
                     int rssi = result.getRssi();
-                    String record = result.getScanRecord().toString(); // 상세 정보
-                    String name = result.getDevice().getName();        // 기기 이름
-                    if (name == null) name = "Unknown Device";
 
-                    // [필터링 시작] 라즈베리파이 주소거나 UUID에 181a가 포함된 경우만!
-                    if (address.equalsIgnoreCase("b8:27:eb:b8:72:af") || record.contains("181a")) {
-                        String time = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
+                    String address = result.getDevice().getAddress();
 
-                        // 강의 자료처럼 구성: 이름, MAC, RSSI, 상세정보 순서
-                        String message = name + "\nMAC: " + address + "\nRSSI: " + rssi + " dBm\n" + record + "\n\n";
+                    String record = "";
+                    if (result.getScanRecord() != null) {
+                        record = result.getScanRecord().toString();
+                    }
 
-                        txtLog.append(message); // 화면에 출력
-                        csvBuffer.append(time).append(",").append(name).append(",").append(address).append(",").append(rssi).append("\n"); // 데이터 저장
-                    }                    }
-                //}
+                    String name = "Unknown Device";
+                    if (ActivityCompat.checkSelfPermission(MainActivity.this,
+                            Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                        String tempName = result.getDevice().getName();
+                        if (tempName != null) {
+                            name = tempName;
+                        }
+                    }
+
+                    // 이름이 Opensrc_team2인 것만 표시
+                    if (!TARGET_NAME.equalsIgnoreCase(name)) {
+                        return;
+                    }
+
+                    String time = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
+
+                    String message = name + "\nMAC: " + address +
+                            "\nRSSI: " + rssi + " dBm\n" + record + "\n\n";
+
+                    txtLog.setText(message);
+
+                    csvBuffer.setLength(0);
+                    csvBuffer.append(time).append(",")
+                            .append(name).append(",")
+                            .append(address).append(",")
+                            .append(rssi).append("\n");
+                }
             };
-            bluetoothLeScanner.startScan(scanCallback); // [cite: 417]
+
+            bluetoothLeScanner.startScan(scanCallback);
             txtStatus.setText("스캔 중...");
             isScanning = true;
         }
     }
 
     private void stopScanning() {
-        // 실행 전 권한이 진짜 있는지 최종 확인 (에러 방지용) [cite: 386-389]
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-            checkPermissions(); // 권한 없으면 다시 요청 [cite: 390]
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN)
+                != PackageManager.PERMISSION_GRANTED) {
+            checkPermissions();
             return;
         }
 
         if (isScanning && bluetoothLeScanner != null) {
-            bluetoothLeScanner.stopScan(scanCallback); // [cite: 406]
+            bluetoothLeScanner.stopScan(scanCallback);
             txtStatus.setText("중지됨");
             isScanning = false;
         }
     }
 
-    private void saveToCsv() {
-        try {
-            File path = getExternalFilesDir(null);
-            File file = new File(path, "ble_data.csv");
+    private void sendDataToServer() {
+        comm_data service = retrofit.create(comm_data.class);
 
-            FileWriter writer = new FileWriter(file, true);
-            if (file.length() == 0) {
-                writer.append("Time,Address,RSSI\n");
+        postdata pd = new postdata();
+
+        String senderId = Settings.Secure.getString(
+                getContentResolver(),
+                Settings.Secure.ANDROID_ID
+        );
+
+        pd.setData(
+                "opensrc2026",   // 🔥 key (이게 401 원인)
+                "team 2",        // 팀명
+                "sensor 2",      // 센서명
+                "b8:27:eb:b8:72:af",
+                28.88,
+                25.42,
+                1,
+                36,
+                427,
+                System.currentTimeMillis()/1000,
+                36.635,
+                127.491,
+                senderId
+        );
+        Call<String> call = service.post_json(pd);
+
+        call.enqueue(new Callback<String>() {
+            @Override
+            public void onResponse(Call<String> call, Response<String> response) {
+                if (response.isSuccessful()) {
+                    txtStatus.setText("전송 성공");
+                    Toast.makeText(MainActivity.this,
+                            "성공: " + response.body(),
+                            Toast.LENGTH_LONG).show();
+                } else {
+                    txtStatus.setText("전송 실패: " + response.code());
+                    Toast.makeText(MainActivity.this,
+                            "실패 코드: " + response.code(),
+                            Toast.LENGTH_LONG).show();
+                }
             }
-            writer.append(csvBuffer.toString());
-            writer.flush();
-            writer.close();
 
-            csvBuffer.setLength(0); // 저장 후 비우기
-            Toast.makeText(this, "저장 성공: " + file.getAbsolutePath(), Toast.LENGTH_SHORT).show();
-        } catch (IOException e) {
-            Toast.makeText(this, "저장 실패", Toast.LENGTH_SHORT).show();
-        }
+            @Override
+            public void onFailure(Call<String> call, Throwable t) {
+                txtStatus.setText("통신 실패");
+                Toast.makeText(MainActivity.this,
+                        "에러: " + t.getMessage(),
+                        Toast.LENGTH_LONG).show();
+            }
+        });
     }
 }

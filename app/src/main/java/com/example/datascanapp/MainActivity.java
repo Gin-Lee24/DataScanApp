@@ -4,11 +4,14 @@ import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanRecord;
 import android.bluetooth.le.ScanResult;
 import android.content.pm.PackageManager;
+import android.location.Location;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
+import android.util.SparseArray;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -16,6 +19,8 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 
 import com.google.android.material.button.MaterialButton;
+import com.google.android.gms.location.FusedLocationProviderClient;
+import com.google.android.gms.location.LocationServices;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 
@@ -39,9 +44,21 @@ public class MainActivity extends AppCompatActivity {
     private StringBuilder csvBuffer = new StringBuilder();
 
     private Retrofit retrofit;
+    private FusedLocationProviderClient fusedLocationClient;
 
-    // 라즈베리파이 이름
     private static final String TARGET_NAME = "Opensrc_team2";
+
+    private String lastMac = "";
+    private double lastTemp = 0.0;
+    private double lastHumidity = 0.0;
+    private int lastAQI = 0;
+    private int lastTVOC = 0;
+    private int lastECO2 = 0;
+    private long lastTimestamp = 0L;
+    private boolean hasParsedData = false;
+
+    private double currentLat = 0.0;
+    private double currentLon = 0.0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -56,6 +73,8 @@ public class MainActivity extends AppCompatActivity {
                 .addConverterFactory(GsonConverterFactory.create(gson))
                 .build();
 
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this);
+
         txtLog = findViewById(R.id.txtLog);
         txtStatus = findViewById(R.id.txtStatus);
         MaterialButton btnScan = findViewById(R.id.btnScan);
@@ -68,16 +87,22 @@ public class MainActivity extends AppCompatActivity {
         }
 
         checkPermissions();
+        updateCurrentLocation();
 
         btnScan.setOnClickListener(v -> {
             txtLog.setText("");
             csvBuffer.setLength(0);
+            hasParsedData = false;
             startScanning();
             txtStatus.setText("스캔 중...");
         });
 
         btnStop.setOnClickListener(v -> stopScanning());
-        btnSave.setOnClickListener(v -> sendDataToServer());
+
+        btnSave.setOnClickListener(v -> {
+            updateCurrentLocation();
+            sendDataToServer();
+        });
     }
 
     private void checkPermissions() {
@@ -94,6 +119,21 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void updateCurrentLocation() {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+
+        fusedLocationClient.getLastLocation()
+                .addOnSuccessListener(location -> {
+                    if (location != null) {
+                        currentLat = location.getLatitude();
+                        currentLon = location.getLongitude();
+                    }
+                });
+    }
+
     private void startScanning() {
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -106,13 +146,7 @@ public class MainActivity extends AppCompatActivity {
                 @Override
                 public void onScanResult(int callbackType, ScanResult result) {
                     int rssi = result.getRssi();
-
                     String address = result.getDevice().getAddress();
-
-                    String record = "";
-                    if (result.getScanRecord() != null) {
-                        record = result.getScanRecord().toString();
-                    }
 
                     String name = "Unknown Device";
                     if (ActivityCompat.checkSelfPermission(MainActivity.this,
@@ -123,23 +157,53 @@ public class MainActivity extends AppCompatActivity {
                         }
                     }
 
-                    // 이름이 Opensrc_team2인 것만 표시
                     if (!TARGET_NAME.equalsIgnoreCase(name)) {
                         return;
                     }
 
-                    String time = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
+                    lastMac = address == null ? "" : address;
 
-                    String message = name + "\nMAC: " + address +
-                            "\nRSSI: " + rssi + " dBm\n" + record + "\n\n";
+                    ScanRecord scanRecord = result.getScanRecord();
+                    byte[] payload = extractManufacturerPayload(scanRecord);
+
+                    if (payload == null || payload.length < 12) {
+                        txtLog.setText(name + "\nMAC: " + lastMac + "\nRSSI: " + rssi +
+                                " dBm\nPayload 파싱 실패");
+                        return;
+                    }
+
+                    parsePayload(payload);
+                    hasParsedData = true;
+
+                    String humanTime = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+                            .format(new Date(lastTimestamp * 1000L));
+
+                    String message =
+                            name + "\n" +
+                                    "MAC: " + lastMac + "\n" +
+                                    "RSSI: " + rssi + " dBm\n" +
+                                    "Temp: " + String.format(Locale.getDefault(), "%.2f", lastTemp) + " °C\n" +
+                                    "Hum: " + String.format(Locale.getDefault(), "%.2f", lastHumidity) + " %\n" +
+                                    "AQI: " + lastAQI + "\n" +
+                                    "TVOC: " + lastTVOC + " ppb\n" +
+                                    "eCO2: " + lastECO2 + " ppm\n" +
+                                    "Time: " + humanTime + "\n" +
+                                    "Lat: " + currentLat + "\n" +
+                                    "Lon: " + currentLon + "\n";
 
                     txtLog.setText(message);
 
                     csvBuffer.setLength(0);
-                    csvBuffer.append(time).append(",")
+                    csvBuffer.append(humanTime).append(",")
                             .append(name).append(",")
-                            .append(address).append(",")
-                            .append(rssi).append("\n");
+                            .append(lastMac).append(",")
+                            .append(lastTemp).append(",")
+                            .append(lastHumidity).append(",")
+                            .append(lastAQI).append(",")
+                            .append(lastTVOC).append(",")
+                            .append(lastECO2).append(",")
+                            .append(currentLat).append(",")
+                            .append(currentLon).append("\n");
                 }
             };
 
@@ -163,9 +227,49 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void sendDataToServer() {
-        comm_data service = retrofit.create(comm_data.class);
+    private byte[] extractManufacturerPayload(ScanRecord scanRecord) {
+        if (scanRecord == null) return null;
 
+        SparseArray<byte[]> manufacturerData = scanRecord.getManufacturerSpecificData();
+        if (manufacturerData == null || manufacturerData.size() == 0) return null;
+
+        for (int i = 0; i < manufacturerData.size(); i++) {
+            byte[] data = manufacturerData.valueAt(i);
+            if (data != null && data.length >= 12) {
+                byte[] payload = new byte[12];
+                System.arraycopy(data, 0, payload, 0, 12);
+                return payload;
+            }
+        }
+        return null;
+    }
+
+    private void parsePayload(byte[] payload) {
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(payload)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+
+        short tempRaw = buffer.getShort();
+        int humRaw = buffer.get() & 0xFF;
+        int aqiRaw = buffer.get() & 0xFF;
+        int tvocRaw = buffer.getShort() & 0xFFFF;
+        int eco2Raw = buffer.getShort() & 0xFFFF;
+        long tsRaw = buffer.getInt() & 0xFFFFFFFFL;
+
+        lastTemp = tempRaw / 100.0;
+        lastHumidity = humRaw;
+        lastAQI = aqiRaw;
+        lastTVOC = tvocRaw;
+        lastECO2 = eco2Raw;
+        lastTimestamp = tsRaw;
+    }
+
+    private void sendDataToServer() {
+        if (!hasParsedData) {
+            Toast.makeText(this, "먼저 BLE 스캔으로 데이터를 받아주세요.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        comm_data service = retrofit.create(comm_data.class);
         postdata pd = new postdata();
 
         String senderId = Settings.Secure.getString(
@@ -174,20 +278,21 @@ public class MainActivity extends AppCompatActivity {
         );
 
         pd.setData(
-                "opensrc2026",   // 🔥 key (이게 401 원인)
-                "team 2",        // 팀명
-                "sensor 2",      // 센서명
-                "b8:27:eb:b8:72:af",
-                28.88,
-                25.42,
-                1,
-                36,
-                427,
-                System.currentTimeMillis()/1000,
-                36.635,
-                127.491,
+                "opensrc2026",
+                "team 2",
+                "sensor 2",
+                lastMac,
+                lastTemp,
+                lastHumidity,
+                lastAQI,
+                lastTVOC,
+                lastECO2,
+                lastTimestamp,
+                currentLat,
+                currentLon,
                 senderId
         );
+
         Call<String> call = service.post_json(pd);
 
         call.enqueue(new Callback<String>() {
